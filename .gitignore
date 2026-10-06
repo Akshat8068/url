@@ -3,6 +3,12 @@
 /node_modules
 /build
 
+# Client
+/client/node_modules
+/client/dist
+/client/.env
+/client/.env.local
+
 # TypeScript build cache
 *.tsbuildinfo
 

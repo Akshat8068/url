@@ -4,10 +4,8 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
-  OneToMany,
   Index,
 } from 'typeorm';
-import { UrlClickEntity } from './url-click.entity.js';
 
 @Entity('urls')
 export class UrlEntity {
@@ -16,6 +14,10 @@ export class UrlEntity {
 
   @Column({ type: 'text' })
   originalUrl: string;
+
+  @Index()
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  urlHash?: string | null;
 
   @Index({ unique: true })
   @Column({ type: 'varchar', length: 32 })
@@ -31,9 +33,6 @@ export class UrlEntity {
   @Column({ type: 'timestamptz', nullable: true })
   expiresAt?: Date | null;
 
-  @Column({ type: 'integer', default: 0 })
-  clicksCount: number;
-
   @Column({ type: 'boolean', default: true })
   isActive: boolean;
 
@@ -42,10 +41,4 @@ export class UrlEntity {
 
   @UpdateDateColumn({ type: 'timestamptz' })
   updatedAt: Date;
-
-  @OneToMany(() => UrlClickEntity, (click) => click.url, {
-    cascade: true,
-    onDelete: 'CASCADE',
-  })
-  clicks: UrlClickEntity[];
 }

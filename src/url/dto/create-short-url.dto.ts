@@ -42,3 +42,16 @@ export class CreateShortUrlDto {
   @IsDateString({}, { message: 'expiresAt must be a valid ISO date string' })
   expiresAt?: string;
 }
+export interface UrlResponseDto {
+  originalUrl: string;
+  shortCode: string;
+  shortUrl: string;
+  customAlias?: string | null;
+  title?: string | null;
+  expiresAt?: Date | null;
+  isExpired: boolean;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+

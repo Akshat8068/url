@@ -40,8 +40,8 @@ DB_PORT=5432
 DB_USERNAME=postgres
 DB_PASSWORD=postgres
 DB_NAME=url_shortener
-DB_SYNC=true
-DB_LOGGING=false
+
+
 ```
 
 ---

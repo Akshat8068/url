@@ -16,8 +16,7 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3000;
   await app.listen(port);
-  console.log(`🚀 URL Shortener server is running at: http://localhost:${port}`);
-  console.log(`📊 Dashboard UI available at: http://localhost:${port}`);
+  console.log(`URL Short API is running at: http://localhost:${port}`);
 }
 
 await bootstrap();

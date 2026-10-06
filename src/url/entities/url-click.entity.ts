@@ -6,8 +6,9 @@ import {
   ManyToOne,
   JoinColumn,
   Index,
+  type Relation,
 } from 'typeorm';
-import { UrlEntity } from './url.entity.js';
+import type { UrlEntity } from './url.entity.js';
 
 @Entity('url_clicks')
 export class UrlClickEntity {
@@ -18,20 +19,11 @@ export class UrlClickEntity {
   @Column({ type: 'uuid' })
   urlId: string;
 
-  @ManyToOne(() => UrlEntity, (url) => url.clicks, {
+  @ManyToOne('UrlEntity', {
     onDelete: 'CASCADE',
   })
   @JoinColumn({ name: 'urlId' })
-  url: UrlEntity;
-
-  @Column({ type: 'varchar', length: 128, nullable: true })
-  ipAddress?: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  userAgent?: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  referer?: string | null;
+  url: Relation<UrlEntity>;
 
   @Column({ type: 'varchar', length: 64, nullable: true })
   browser?: string | null;

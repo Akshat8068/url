@@ -11,9 +11,7 @@ import {
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { UrlService } from './url.service.js';
-import { CreateShortUrlDto } from './dto/create-short-url.dto.js';
-import { UrlResponseDto } from './dto/url-response.dto.js';
-import { UrlAnalyticsDto } from './dto/analytics-response.dto.js';
+import { CreateShortUrlDto, UrlResponseDto } from './dto/create-short-url.dto.js';
 
 @Controller('api/urls')
 export class UrlController {
@@ -27,10 +25,7 @@ export class UrlController {
 
   @Post()
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
-  async create(
-    @Body() createDto: CreateShortUrlDto,
-    @Req() req: Request,
-  ): Promise<UrlResponseDto> {
+  async create(@Body() createDto: CreateShortUrlDto,@Req() req: Request,): Promise<UrlResponseDto> {
     const baseUrl = this.getBaseUrl(req);
     return this.urlService.create(createDto, baseUrl);
   }
@@ -41,13 +36,11 @@ export class UrlController {
     return this.urlService.getAll(baseUrl);
   }
 
-  @Get(':codeOrId/analytics')
-  async getAnalytics(
-    @Param('codeOrId') codeOrId: string,
-    @Req() req: Request,
-  ): Promise<UrlAnalyticsDto> {
+  @Get(':idOrCode')
+  async getOne(@Param('idOrCode') idOrCode: string,@Req() req: Request,
+  ): Promise<UrlResponseDto> {
     const baseUrl = this.getBaseUrl(req);
-    return this.urlService.getAnalytics(codeOrId, baseUrl);
+    return this.urlService.getById(idOrCode, baseUrl);
   }
 
   @Delete(':id')

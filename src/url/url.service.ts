@@ -8,12 +8,9 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { customAlphabet } from 'nanoid';
-import { UAParser } from 'ua-parser-js';
 import { UrlEntity } from './entities/url.entity.js';
-import { UrlClickEntity } from './entities/url-click.entity.js';
-import { CreateShortUrlDto } from './dto/create-short-url.dto.js';
-import { UrlResponseDto } from './dto/url-response.dto.js';
-import { UrlAnalyticsDto, StatCount, ClicksOverTime } from './dto/analytics-response.dto.js';
+import { CreateShortUrlDto, UrlResponseDto } from './dto/create-short-url.dto.js';
+import { RedisService } from '../redis/redis.service.js';
 
 const nanoid = customAlphabet(
   '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
@@ -25,8 +22,7 @@ export class UrlService {
   constructor(
     @InjectRepository(UrlEntity)
     private readonly urlRepository: Repository<UrlEntity>,
-    @InjectRepository(UrlClickEntity)
-    private readonly clickRepository: Repository<UrlClickEntity>,
+    private readonly redisService: RedisService,
   ) {}
 
   private mapToResponseDto(url: UrlEntity, baseUrl: string): UrlResponseDto {
@@ -35,7 +31,6 @@ export class UrlService {
     const isExpired = url.expiresAt ? new Date(url.expiresAt) < new Date() : false;
 
     return {
-      id: url.id,
       originalUrl: url.originalUrl,
       shortCode: url.shortCode,
       shortUrl: `${cleanBaseUrl}/${code}`,
@@ -43,26 +38,82 @@ export class UrlService {
       title: url.title,
       expiresAt: url.expiresAt,
       isExpired,
-      clicksCount: url.clicksCount,
       isActive: url.isActive,
       createdAt: url.createdAt,
       updatedAt: url.updatedAt,
     };
   }
 
+  private calculateTtlSeconds(expiresAt?: Date | null): number | undefined {
+    if (!expiresAt) return undefined;
+    const diffMs = new Date(expiresAt).getTime() - Date.now();
+    return diffMs > 0 ? Math.floor(diffMs / 1000) : 0;
+  }
+
   async create(dto: CreateShortUrlDto, baseUrl: string): Promise<UrlResponseDto> {
+    const originalUrl = dto.originalUrl.trim();
     let customAlias = dto.customAlias?.trim();
+    const urlHash = this.redisService.hashUrl(originalUrl);
+
+    // 1. If custom alias is provided, ensure it's not already in use
     if (customAlias) {
-      const existing = await this.urlRepository.findOne({
+      const existingAlias = await this.urlRepository.findOne({
         where: [{ customAlias }, { shortCode: customAlias }],
       });
-      if (existing) {
-        throw new ConflictException(`Custom alias "${customAlias}" is already in use.`);
+      if (existingAlias) {
+        throw new ConflictException(`Custom alias "${customAlias}" is already taken.`);
       }
     } else {
       customAlias = null;
+
+      // 2. Redis Fast Check (Deduplication via Hash)
+      const cachedCode = await this.redisService.getShortCodeByHash(urlHash);
+      if (cachedCode) {
+        const existingCachedUrl = await this.urlRepository.findOne({
+          where: { shortCode: cachedCode, isActive: true },
+        });
+
+        if (existingCachedUrl) {
+          const isExpired = existingCachedUrl.expiresAt
+            ? new Date(existingCachedUrl.expiresAt) <= new Date()
+            : false;
+          if (!isExpired) {
+            return this.mapToResponseDto(existingCachedUrl, baseUrl);
+          }
+        }
+      }
+
+      // 3. DB Fallback Check (Deduplication via urlHash or originalUrl)
+      const existingUrl = await this.urlRepository.findOne({
+        where: [
+          { urlHash, isActive: true },
+          { originalUrl, isActive: true },
+        ],
+        order: { createdAt: 'DESC' },
+      });
+
+      if (existingUrl) {
+        const isExpired = existingUrl.expiresAt
+          ? new Date(existingUrl.expiresAt) <= new Date()
+          : false;
+
+        if (!isExpired) {
+          // Repopulate Redis cache (Self-healing)
+          const ttlSeconds = this.calculateTtlSeconds(existingUrl.expiresAt);
+          await this.redisService.cacheUrlMapping({
+            hash: urlHash,
+            shortCode: existingUrl.shortCode,
+            originalUrl: existingUrl.originalUrl,
+            customAlias: existingUrl.customAlias,
+            ttlSeconds,
+          });
+
+          return this.mapToResponseDto(existingUrl, baseUrl);
+        }
+      }
     }
 
+    // 4. Generate a unique short code
     let shortCode = '';
     let isUnique = false;
     let attempts = 0;
@@ -93,18 +144,57 @@ export class UrlService {
       expiresAt = new Date(Date.now() + dto.expiresInMinutes * 60 * 1000);
     }
 
+    // 5. Save to Database with urlHash
     const newUrl = this.urlRepository.create({
-      originalUrl: dto.originalUrl,
+      originalUrl,
+      urlHash,
       shortCode,
       customAlias,
       title: dto.title || null,
       expiresAt,
-      clicksCount: 0,
       isActive: true,
     });
 
-    const saved = await this.urlRepository.save(newUrl);
+    const saved = await this.urlRepository.save(newUrl) as UrlEntity;
+
+    // 6. Write to Redis (Bidirectional Cache)
+    const ttlSeconds = this.calculateTtlSeconds(expiresAt);
+    await this.redisService.cacheUrlMapping({
+      hash: urlHash,
+      shortCode: saved.shortCode,
+      originalUrl: saved.originalUrl,
+      customAlias: saved.customAlias,
+      ttlSeconds,
+    });
+
     return this.mapToResponseDto(saved, baseUrl);
+  }
+
+  /**
+   * Fast redirect lookup: checks Redis first (<1ms), falls back to DB on miss
+   */
+  async getDestinationForRedirect(code: string): Promise<string> {
+    // 1. Redis Cache Hit Check
+    const cachedUrl = await this.redisService.getOriginalUrlByCode(code);
+    if (cachedUrl) {
+      return cachedUrl;
+    }
+
+    // 2. Cache Miss: Query PostgreSQL
+    const url = await this.findByCodeOrAlias(code);
+
+    // 3. Repopulate Redis Cache (Self-healing)
+    const ttlSeconds = this.calculateTtlSeconds(url.expiresAt);
+    const hash = url.urlHash || this.redisService.hashUrl(url.originalUrl);
+    await this.redisService.cacheUrlMapping({
+      hash,
+      shortCode: url.shortCode,
+      originalUrl: url.originalUrl,
+      customAlias: url.customAlias,
+      ttlSeconds,
+    });
+
+    return url.originalUrl;
   }
 
   async findByCodeOrAlias(code: string): Promise<UrlEntity> {
@@ -126,58 +216,6 @@ export class UrlService {
     return url;
   }
 
-  async recordClick(
-    url: UrlEntity,
-    meta: {
-      ip?: string;
-      userAgent?: string;
-      referer?: string;
-    },
-  ): Promise<void> {
-    try {
-      let browser = 'Unknown';
-      let os = 'Unknown';
-      let device = 'Desktop';
-
-      if (meta.userAgent) {
-        const parser = new UAParser(meta.userAgent);
-        const parsed = parser.getResult();
-        browser = parsed.browser.name || 'Unknown';
-        os = parsed.os.name || 'Unknown';
-        device = parsed.device.type
-          ? parsed.device.type.charAt(0).toUpperCase() + parsed.device.type.slice(1)
-          : 'Desktop';
-      }
-
-      let refererClean: string | null = null;
-      if (meta.referer) {
-        try {
-          const urlObj = new URL(meta.referer);
-          refererClean = urlObj.hostname || meta.referer;
-        } catch {
-          refererClean = meta.referer;
-        }
-      } else {
-        refererClean = 'Direct / Email / App';
-      }
-
-      const click = this.clickRepository.create({
-        urlId: url.id,
-        ipAddress: meta.ip || null,
-        userAgent: meta.userAgent || null,
-        referer: refererClean,
-        browser,
-        os,
-        device,
-      });
-
-      await this.clickRepository.save(click);
-      await this.urlRepository.increment({ id: url.id }, 'clicksCount', 1);
-    } catch (err) {
-      console.error('Error recording click analytics:', err);
-    }
-  }
-
   async getAll(baseUrl: string): Promise<UrlResponseDto[]> {
     const urls = await this.urlRepository.find({
       order: { createdAt: 'DESC' },
@@ -185,94 +223,59 @@ export class UrlService {
     return urls.map((u) => this.mapToResponseDto(u, baseUrl));
   }
 
-  async getAnalytics(codeOrId: string, baseUrl: string): Promise<UrlAnalyticsDto> {
+  private isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  }
+
+  async getById(idOrCode: string, baseUrl: string): Promise<UrlResponseDto> {
+    const whereConditions: Array<{ id?: string; shortCode?: string; customAlias?: string }> = [
+      { shortCode: idOrCode },
+      { customAlias: idOrCode },
+    ];
+
+    if (this.isUuid(idOrCode)) {
+      whereConditions.unshift({ id: idOrCode });
+    }
+
     const url = await this.urlRepository.findOne({
-      where: [{ id: codeOrId }, { shortCode: codeOrId }, { customAlias: codeOrId }],
+      where: whereConditions,
     });
 
     if (!url) {
       throw new NotFoundException(`URL not found.`);
     }
 
-    const clicks = await this.clickRepository.find({
-      where: { urlId: url.id },
-      order: { createdAt: 'DESC' },
-      take: 500,
-    });
-
-    // Aggregate stats
-    const referrerMap = new Map<string, number>();
-    const browserMap = new Map<string, number>();
-    const osMap = new Map<string, number>();
-    const deviceMap = new Map<string, number>();
-    const dateMap = new Map<string, number>();
-
-    // Pre-populate last 7 days
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      const dateKey = d.toISOString().split('T')[0];
-      dateMap.set(dateKey, 0);
-    }
-
-    clicks.forEach((c) => {
-      // Date count
-      const dateKey = c.createdAt.toISOString().split('T')[0];
-      dateMap.set(dateKey, (dateMap.get(dateKey) || 0) + 1);
-
-      // Referrer
-      const ref = c.referer || 'Direct / Email / App';
-      referrerMap.set(ref, (referrerMap.get(ref) || 0) + 1);
-
-      // Browser
-      const br = c.browser || 'Unknown';
-      browserMap.set(br, (browserMap.get(br) || 0) + 1);
-
-      // OS
-      const os = c.os || 'Unknown';
-      osMap.set(os, (osMap.get(os) || 0) + 1);
-
-      // Device
-      const dev = c.device || 'Desktop';
-      deviceMap.set(dev, (deviceMap.get(dev) || 0) + 1);
-    });
-
-    const mapToSortedStatCounts = (map: Map<string, number>): StatCount[] =>
-      Array.from(map.entries())
-        .map(([name, count]) => ({ name, count }))
-        .sort((a, b) => b.count - a.count);
-
-    const clicksOverTime: ClicksOverTime[] = Array.from(dateMap.entries()).map(
-      ([date, count]) => ({ date, count }),
-    );
-
-    return {
-      url: this.mapToResponseDto(url, baseUrl),
-      totalClicks: url.clicksCount,
-      clicksOverTime,
-      topReferrers: mapToSortedStatCounts(referrerMap).slice(0, 10),
-      topBrowsers: mapToSortedStatCounts(browserMap).slice(0, 10),
-      topOperatingSystems: mapToSortedStatCounts(osMap).slice(0, 10),
-      topDevices: mapToSortedStatCounts(deviceMap).slice(0, 10),
-      recentClicks: clicks.slice(0, 50).map((c) => ({
-        id: c.id,
-        ipAddress: c.ipAddress,
-        referer: c.referer,
-        browser: c.browser,
-        os: c.os,
-        device: c.device,
-        createdAt: c.createdAt,
-      })),
-    };
+    return this.mapToResponseDto(url, baseUrl);
   }
 
   async delete(id: string): Promise<{ success: boolean; message: string }> {
-    const url = await this.urlRepository.findOne({ where: { id } });
-    if (!url) {
-      throw new NotFoundException(`URL not found`);
+    // 1. Fetch URL to get hash and aliases for cache eviction
+    const whereConditions: Array<{ id?: string; shortCode?: string; customAlias?: string }> = [
+      { shortCode: id },
+      { customAlias: id },
+    ];
+    if (this.isUuid(id)) {
+      whereConditions.unshift({ id });
     }
 
-    await this.urlRepository.remove(url);
+    const existingUrl = await this.urlRepository.findOne({ where: whereConditions });
+
+    if (!existingUrl) {
+      throw new NotFoundException(`URL with identifier "${id}" not found.`);
+    }
+
+    // 2. Delete from DB
+    await this.urlRepository.delete(existingUrl.id);
+
+    // 3. Invalidate Redis Cache
+    const hash = existingUrl.urlHash || this.redisService.hashUrl(existingUrl.originalUrl);
+    await this.redisService.deleteUrlMapping({
+      hash,
+      shortCode: existingUrl.shortCode,
+      customAlias: existingUrl.customAlias,
+    });
+
     return { success: true, message: 'URL deleted successfully.' };
   }
 }
+

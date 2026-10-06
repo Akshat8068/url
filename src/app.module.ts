@@ -1,17 +1,18 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ServeStaticModule } from '@nestjs/serve-static';
-import { join } from 'node:path';
+import { AppController } from './app.controller.js';
+import { AppService } from './app.service.js';
 import { UrlModule } from './url/url.module.js';
 import { UrlEntity } from './url/entities/url.entity.js';
-import { UrlClickEntity } from './url/entities/url-click.entity.js';
+import { RedisModule } from './redis/redis.module.js';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    RedisModule,
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -22,17 +23,13 @@ import { UrlClickEntity } from './url/entities/url-click.entity.js';
         username: configService.get<string>('DB_USERNAME', 'postgres'),
         password: configService.get<string>('DB_PASSWORD', 'postgres'),
         database: configService.get<string>('DB_NAME', 'url_shortener'),
-        entities: [UrlEntity, UrlClickEntity],
-        synchronize: configService.get<string>('DB_SYNC', 'true') === 'true',
-        logging: configService.get<string>('DB_LOGGING', 'false') === 'true',
+        entities: [UrlEntity],
+        synchronize: true,
       }),
-    }),
-    ServeStaticModule.forRoot({
-      rootPath: join(process.cwd(), 'public'),
-      serveRoot: '/',
-      exclude: ['/api/(.*)'],
     }),
     UrlModule,
   ],
+  controllers: [AppController],
+  providers: [AppService],
 })
 export class AppModule {}
